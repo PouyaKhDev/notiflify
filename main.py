@@ -561,24 +561,47 @@ def send_telegram_alert(
         print(f"Warning: Failed to send Telegram alert: {e}", file=sys.stderr)
 
 
+# Global state dictionary accessible by the health check server
+SCANNER_STATE: Dict[str, Any] = {
+    "status": "starting",
+    "cycles_completed": 0,
+    "last_scan_utc": "none",
+    "next_scan_utc": "pending",
+    "setups_detected": 0,
+}
+
+
 def start_health_server(port: int) -> None:
     """Runs a minimal HTTP server responding with 200 OK for Render free-tier health checks."""
     class HealthHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            self.wfile.write(b"OK: Binance Blow-Off Top Scanner is running.\n")
+            body = (
+                f"OK: Binance Blow-Off Top Scanner is running.\n"
+                f"Status: {SCANNER_STATE['status']}\n"
+                f"Cycles Completed: {SCANNER_STATE['cycles_completed']}\n"
+                f"Last Scan (UTC): {SCANNER_STATE['last_scan_utc']}\n"
+                f"Next Scan (UTC): {SCANNER_STATE['next_scan_utc']}\n"
+                f"Setups in Last Scan: {SCANNER_STATE['setups_detected']}\n"
+            )
+            self.wfile.write(body.encode("utf-8"))
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
 
         def log_message(self, format, *args):
             pass  # Silence routine health check logs
 
     try:
         with socketserver.TCPServer(("", port), HealthHandler) as httpd:
-            print(f"{GREEN}Render health check HTTP server listening on port {port}{RESET}")
+            print(f"{GREEN}Render health check HTTP server listening on port {port}{RESET}", flush=True)
             httpd.serve_forever()
     except Exception as e:
-        print(f"Warning: Health check server failed on port {port}: {e}", file=sys.stderr)
+        print(f"Warning: Health check server failed on port {port}: {e}", file=sys.stderr, flush=True)
 
 
 def run_scan(config: Dict[str, Any], session: Optional[requests.Session] = None) -> List[Dict[str, Any]]:
@@ -735,23 +758,33 @@ def main() -> int:
         except ValueError:
             pass
 
+    cycle_count = 0
     try:
         while True:
+            cycle_count += 1
             cycle_start = time.time()
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            SCANNER_STATE["status"] = "scanning"
+
             try:
                 results = run_scan(cfg, session)
                 if args.json:
-                    print(json.dumps(results, indent=2))
+                    print(json.dumps(results, indent=2), flush=True)
                 else:
-                    print(format_terminal_table(results, cfg))
+                    print(format_terminal_table(results, cfg), flush=True)
 
+                SCANNER_STATE["setups_detected"] = len(results)
                 # Dispatch Telegram notifications if configured
                 send_telegram_alert(results, cfg, session)
 
             except PermissionError as pe:
-                print(f"\n{RED}{BOLD}ERROR:{RESET} {pe}\n", file=sys.stderr)
+                print(f"\n{RED}{BOLD}ERROR:{RESET} {pe}\n", file=sys.stderr, flush=True)
             except Exception as e:
-                print(f"\n{RED}{BOLD}SCANNER ERROR during cycle:{RESET} {e}\n", file=sys.stderr)
+                print(f"\n{RED}{BOLD}SCANNER ERROR during cycle:{RESET} {e}\n", file=sys.stderr, flush=True)
+
+            SCANNER_STATE["cycles_completed"] = cycle_count
+            SCANNER_STATE["last_scan_utc"] = now_str
+            SCANNER_STATE["status"] = "sleeping"
 
             # Sleep until the next cycle
             elapsed = time.time() - cycle_start
@@ -762,6 +795,10 @@ def main() -> int:
                 now_sec = time.time()
                 next_5m = ((int(now_sec) // 300) + 1) * 300
                 sleep_duration = max(5.0, next_5m - now_sec)
+
+            next_scan_time = datetime.fromtimestamp(time.time() + sleep_duration, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            SCANNER_STATE["next_scan_utc"] = next_scan_time
+            print(f"{DIM}[Cycle #{cycle_count}] Scan finished. Sleeping {sleep_duration:.1f}s until {next_scan_time}...{RESET}\n", flush=True)
 
             time.sleep(sleep_duration)
 
